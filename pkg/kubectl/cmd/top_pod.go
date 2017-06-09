@@ -20,16 +20,20 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sort"
+	"strings"
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	clientapi "k8s.io/client-go/pkg/api/v1"
 	"k8s.io/kubernetes/pkg/api"
 	coreclient "k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset/typed/core/internalversion"
 	"k8s.io/kubernetes/pkg/kubectl/cmd/templates"
 	cmdutil "k8s.io/kubernetes/pkg/kubectl/cmd/util"
 	"k8s.io/kubernetes/pkg/kubectl/metricsutil"
 	"k8s.io/kubernetes/pkg/util/i18n"
+	metricsapi "k8s.io/metrics/pkg/apis/metrics/v1alpha1"
 
 	"github.com/golang/glog"
 	"github.com/spf13/cobra"
@@ -39,6 +43,7 @@ type TopPodOptions struct {
 	ResourceName    string
 	Namespace       string
 	Selector        string
+	Sort            string
 	AllNamespaces   bool
 	PrintContainers bool
 	PodClient       coreclient.PodsGetter
@@ -96,6 +101,8 @@ func NewCmdTopPod(f cmdutil.Factory, out io.Writer) *cobra.Command {
 	cmd.Flags().StringVarP(&options.Selector, "selector", "l", "", "Selector (label query) to filter on, supports '=', '==', and '!='.")
 	cmd.Flags().BoolVar(&options.PrintContainers, "containers", false, "If present, print usage of containers within a pod.")
 	cmd.Flags().BoolVar(&options.AllNamespaces, "all-namespaces", false, "If present, list the requested object(s) across all namespaces. Namespace in current context is ignored even if specified with --namespace.")
+	cmd.Flags().StringVarP(&options.Sort, "sort", "z", "", "Sort (label query) to sort pods on")
+
 	options.HeapsterOptions.Bind(cmd.Flags())
 	return cmd
 }
@@ -152,7 +159,107 @@ func (o TopPodOptions) RunTopPod() error {
 	if err != nil {
 		return err
 	}
+
+	// Perform any sorting
+	if o.metricsNeedSort() {
+		o.sort(metrics)
+	}
 	return o.Printer.PrintPodMetrics(metrics, o.PrintContainers, o.AllNamespaces)
+}
+
+func (o TopPodOptions) metricsNeedSort() bool {
+	return o.Sort != ""
+}
+
+type aggregatesByCpu []*aggregate
+type aggregatesByMemory []*aggregate
+
+var _ sort.Interface = (aggregatesByCpu)(nil)
+var _ sort.Interface = (aggregatesByMemory)(nil)
+
+func (m aggregatesByCpu) Less(i, j int) bool {
+	return m[i].totalCpu < m[j].totalCpu
+}
+
+func (m aggregatesByCpu) Len() int { return len(m) }
+
+func (m aggregatesByCpu) Swap(i, j int) {
+	m[i], m[j] = m[j], m[i]
+}
+
+func (o TopPodOptions) sort(metrics []metricsapi.PodMetrics) {
+	sortAttr := strings.ToLower(strings.TrimSpace(o.Sort))
+	switch sortAttr {
+	case "cpu":
+		sortByCpu(metrics)
+	case "memory":
+		sortByMemory(metrics)
+	}
+}
+
+func (m aggregatesByMemory) Less(i, j int) bool {
+	return m[i].totalMemory < m[j].totalMemory
+}
+
+func (m aggregatesByMemory) Len() int { return len(m) }
+
+func (m aggregatesByMemory) Swap(i, j int) {
+	m[i], m[j] = m[j], m[i]
+}
+
+func totalValue(containers []metricsapi.ContainerMetrics, key clientapi.ResourceName) uint64 {
+	total := uint64(0)
+	for _, c := range containers {
+		if c.Usage == nil {
+			continue
+		}
+		if value, ok := c.Usage[key]; ok {
+			total += uint64(value.Value())
+		}
+	}
+	return total
+}
+
+type aggregate struct {
+	totalCpu    uint64
+	totalMemory uint64
+	index       int
+}
+
+func sortMetrics(metrics []metricsapi.PodMetrics, fn func(int, metricsapi.PodMetrics) *aggregate, sorter func([]*aggregate)) {
+	aggregates := make([]*aggregate, 0, len(metrics))
+	for i, m := range metrics {
+		aggregates = append(aggregates, fn(i, m))
+	}
+
+	sorter(aggregates)
+
+	// Now recreate the list using the sorted indices
+	sortedMetrics := make([]metricsapi.PodMetrics, 0, len(metrics))
+	for _, agg := range aggregates {
+		sortedMetrics = append(sortedMetrics, metrics[agg.index])
+	}
+	copy(metrics, sortedMetrics)
+}
+
+func sortByCpu(metrics []metricsapi.PodMetrics) {
+	toAggregate := func(i int, m metricsapi.PodMetrics) *aggregate {
+		return &aggregate{index: i, totalCpu: totalValue(m.Containers, "cpu")}
+	}
+
+	sortMetrics(metrics, toAggregate, func(aggs []*aggregate) {
+		sort.Sort(aggregatesByCpu(aggs))
+	})
+}
+
+func sortByMemory(metrics []metricsapi.PodMetrics) {
+	toAggregate := func(i int, m metricsapi.PodMetrics) *aggregate {
+		return &aggregate{index: i, totalMemory: totalValue(m.Containers, "memory")}
+	}
+
+	sortMetrics(metrics, toAggregate, func(aggs []*aggregate) {
+		sort.Sort(aggregatesByMemory(aggs))
+	})
 }
 
 func verifyEmptyMetrics(o TopPodOptions, selector labels.Selector) error {
